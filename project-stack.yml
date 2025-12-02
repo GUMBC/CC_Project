@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Gayatri AWS Project - VPC + ALB + EC2 + RDS + S3 + Lambda (uses existing VPC & subnets from Terraform)
+
+Parameters:
+  VpcId:
+    Type: String
+  PublicSubnet1Id:
+    Type: String
+  PublicSubnet2Id:
+    Type: String
+  PrivateSubnet1Id:
+    Type: String
+  PrivateSubnet2Id:
+    Type: String
+  WebSgId:
+    Type: String
+  AlbSgId:
+    Type: String
+  DbSgId:
+    Type: String
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+  AmiId:
+    Type: String
+
+  DBUsername:
+    Type: String
+    NoEcho: true
+  DBPassword:
+    Type: String
+    NoEcho: true
+  S3BucketName:
+    Type: String
+
+Resources:
+  ##############################################
+  # EC2 Web Server
+  ##############################################
+  WebInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      Path: /
+      RoleName: gayatri-web-ec2-role
+
+  WebInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebInstanceRole
+      InstanceProfileName: gayatri-web-ec2-profile
+
+  WebServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: t2.micro
+      SubnetId: !Ref PublicSubnet1Id
+      SecurityGroupIds:
+        - !Ref WebSgId
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref WebInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y httpd mariadb105 mysql
+          systemctl enable httpd
+          systemctl start httpd
+
+          echo "Hello from Gayatri's EC2<br>EC2 + ALB Working" > /var/www/html/index.html
+      Tags:
+        - Key: Name
+          Value: gayatri-web-server
+
+  ##############################################
+  # Application Load Balancer + Target Group
+  ##############################################
+  WebALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: gayatri-WebALB
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref AlbSgId
+      Subnets:
+        - !Ref PublicSubnet1Id
+        - !Ref PublicSubnet2Id
+      Tags:
+        - Key: Name
+          Value: gayatri-WebALB
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      Targets:
+        - Id: !Ref WebServerInstance
+          Port: 80
+
+  WebListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  ##############################################
+  # RDS MySQL (Multi-AZ)
+  ##############################################
+  ProjectDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "DB subnet group for Gayatri project"
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      DBSubnetGroupName: gayatri-project-dbsubnet
+
+  ProjectDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: gayatri-projectdb
+      AllocatedStorage: 20
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: "8.0"
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !Ref DbSgId
+      DBSubnetGroupName: !Ref ProjectDBSubnetGroup
+      MultiAZ: true
+      PubliclyAccessible: false
+      DeletionProtection: false
+
+  ##############################################
+  # S3 Bucket + Lambda Trigger
+  ##############################################
+  ProjectBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3UploadLoggerLambda.Arn
+
+  S3LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3UploadLoggerLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt ProjectBucket.Arn
+
+  S3UploadLoggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /
+      RoleName: gayatri-s3-lambda-role
+
+  S3UploadLoggerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: gayatri-s3-upload-logger
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !GetAtt S3UploadLoggerLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("New S3 event: %s", json.dumps(event))
+              return {"statusCode": 200, "body": "OK"}
+
+Outputs:
+  ALBDNS:
+    Description: "ALB DNS name"
+    Value: !GetAtt WebALB.DNSName
+
+  RDSEndpoint:
+    Description: "RDS endpoint"
+    Value: !GetAtt ProjectDB.Endpoint.Address
+
+  S3BucketOut:
+    Description: "S3 bucket name"
+    Value: !Ref ProjectBucket
+
+  LambdaName:
+    Description: "Lambda function name"
+    Value: !Ref S3UploadLoggerLambda
+
